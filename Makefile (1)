@@ -1,0 +1,120 @@
+# BlueHammer x64 build for MinGW-w64. Invoke with: mingw32-make
+
+CONFIG ?= release
+CROSS_PREFIX ?=
+
+ifeq ($(origin CC), default)
+CC := $(CROSS_PREFIX)gcc
+endif
+ifeq ($(origin CXX), default)
+CXX := $(CROSS_PREFIX)g++
+endif
+DLLTOOL ?= $(CROSS_PREFIX)dlltool
+
+ifeq ($(CONFIG),release)
+OPT_FLAGS := -O2 -DNDEBUG
+else ifeq ($(CONFIG),debug)
+OPT_FLAGS := -O0 -g
+else
+$(error CONFIG must be either release or debug)
+endif
+
+BUILD_DIR := build/$(CONFIG)
+TARGET := $(BUILD_DIR)/FunnyApp.exe
+
+COMMON_DEFS := \
+	-DUNICODE \
+	-D_UNICODE \
+	-D_CONSOLE \
+	-D_CRT_SECURE_NO_WARNINGS \
+	-D_WIN32_WINNT=0x0A00 \
+	-DWINVER=0x0A00 \
+	-DNTDDI_VERSION=0x0A000006 \
+	-D_M_AMD64=100
+
+CPPFLAGS += -Icompat -I. $(EXTRA_CPPFLAGS) $(COMMON_DEFS)
+CXXFLAGS += -m64 -std=gnu++17 -w -ffunction-sections -fdata-sections $(OPT_FLAGS)
+CFLAGS += -m64 -std=gnu11 -w -ffunction-sections -fdata-sections $(OPT_FLAGS)
+LDFLAGS += -m64 -municode -static -Wl,--gc-sections
+LDLIBS += \
+	-ldelayimp \
+	-lwininet \
+	-lktmw32 \
+	-lshlwapi \
+	-lrpcrt4 \
+	-lntdll \
+	-lcabinet \
+	-lole32 \
+	-loleaut32 \
+	-ladvapi32 \
+	-luser32
+
+MAIN_OBJ := $(BUILD_DIR)/FunnyApp.o
+RPC_OBJ := $(BUILD_DIR)/windefend_client.o
+CLDAPI_DELAY_LIB := $(BUILD_DIR)/libcldapi_delay.a
+OFFREG_DELAY_LIB := $(BUILD_DIR)/liboffreg_delay.a
+OBJECTS := $(MAIN_OBJ) $(RPC_OBJ)
+DELAY_LIBS := $(CLDAPI_DELAY_LIB) $(OFFREG_DELAY_LIB)
+
+.DEFAULT_GOAL := all
+.PHONY: all release debug clean rebuild smoke info
+
+all: $(TARGET)
+
+release:
+	@$(MAKE) CONFIG=release all
+
+debug:
+	@$(MAKE) CONFIG=debug all
+
+rebuild: clean
+	@$(MAKE) CONFIG=$(CONFIG) all
+
+$(TARGET): $(OBJECTS) $(DELAY_LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $(OBJECTS) $(DELAY_LIBS) $(LDLIBS)
+
+$(MAIN_OBJ): FunnyApp.cpp windefend_h.h offreg.h compat/cfapi.h | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DINITGUID -c $< -o $@
+
+$(RPC_OBJ): compat/windefend_client.c windefend_c.c windefend_h.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(CLDAPI_DELAY_LIB): compat/cldapi.def | $(BUILD_DIR)
+	$(DLLTOOL) -d $< -y $@ -D CldApi.dll -m i386:x86-64
+
+$(OFFREG_DELAY_LIB): compat/offreg.def | $(BUILD_DIR)
+	$(DLLTOOL) -d $< -y $@ -D OFFREG.dll -m i386:x86-64
+
+ifeq ($(OS),Windows_NT)
+SHELL := cmd.exe
+.SHELLFLAGS := /C
+
+$(BUILD_DIR):
+	@if not exist "$(subst /,\,$@)" mkdir "$(subst /,\,$@)"
+
+clean:
+	@if exist "build" rmdir /S /Q "build"
+
+smoke: $(TARGET)
+	@"$(subst /,\,$(TARGET))" --help | findstr /B /C:"Usage:"
+else
+$(BUILD_DIR):
+	@mkdir -p "$@"
+
+clean:
+	@rm -rf -- build
+
+smoke: $(TARGET)
+	@if test -z "$(RUNNER)"; then \
+		echo "Set RUNNER to a Windows runner, for example: make smoke RUNNER=wine"; \
+		exit 2; \
+	fi
+	@$(RUNNER) "$(TARGET)" --help | grep '^Usage:'
+endif
+
+info:
+	@echo Configuration: $(CONFIG)
+	@echo C compiler:   $(CC)
+	@echo C++ compiler: $(CXX)
+	@echo DLL tool:     $(DLLTOOL)
+	@echo Output:       $(TARGET)
